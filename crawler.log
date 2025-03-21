@@ -1,0 +1,12 @@
+2025-03-21 11:37:45,485 - INFO - ====== WebDriver manager ======
+2025-03-21 11:37:45,679 - INFO - Get LATEST chromedriver version for google-chrome
+2025-03-21 11:37:45,747 - INFO - Get LATEST chromedriver version for google-chrome
+2025-03-21 11:37:45,797 - INFO - Driver [/Users/mehdi/.wdm/drivers/chromedriver/mac64/134.0.6998.90/chromedriver-mac-arm64/chromedriver] found in cache
+2025-03-21 11:37:47,374 - INFO - WebDriver set up successfully
+2025-03-21 11:37:47,374 - INFO - Crawling page 1: https://startup.registroimprese.it/index
+2025-03-21 11:37:53,839 - INFO - Found 0 unique company links
+2025-03-21 11:37:53,839 - INFO - Found 0 company links on page 1
+2025-03-21 11:37:53,876 - INFO - No next page found, crawling completed
+2025-03-21 11:37:53,950 - INFO - Browser closed successfully
+2025-03-21 11:37:53,950 - INFO - Crawling completed. Collected data for 0 companies.
+2025-03-21 11:37:53,950 - INFO - Script execution completed
