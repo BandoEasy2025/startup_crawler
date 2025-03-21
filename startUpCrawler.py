@@ -1,541 +1,617 @@
-import requests
-from bs4 import BeautifulSoup
-import csv
-import time
-import random
+# startup_crawler.py - Main crawler script
+
+import scrapy
+from scrapy.crawler import CrawlerProcess
+from scrapy.utils.project import get_project_settings
 import os
 import re
+import json
+import csv
 import logging
 from urllib.parse import urljoin
+from datetime import datetime
+import requests
+from scrapy.http import FormRequest
+from scrapy.utils.response import open_in_browser
+import random
+import time
+import wget
+from pathlib import Path
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("crawler.log"),
+        logging.FileHandler("startup_crawler.log"),
         logging.StreamHandler()
     ]
 )
 
-class ItalianStartupCrawler:
-    def __init__(self):
-        self.base_url = "https://startup.registroimprese.it/isin/home"
-        self.search_url = "https://startup.registroimprese.it/isin/search"
-        self.session = requests.Session()
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9,it;q=0.8',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Cache-Control': 'max-age=0',
-            'Origin': 'https://startup.registroimprese.it',
-            'Referer': 'https://startup.registroimprese.it/isin/home'
-        }
-        self.output_file = "italian_startups.csv"
-        # Define CSV headers
-        self.fieldnames = [
-            'company_name', 
-            'creation_date', 
-            'region', 
-            'city', 
-            'description', 
-            'email', 
-            'phone'
+class StartupItem(scrapy.Item):
+    """Define the item structure for storing startup data"""
+    company_name = scrapy.Field()
+    creation_date = scrapy.Field()
+    region = scrapy.Field()
+    city = scrapy.Field()
+    description = scrapy.Field()
+    email = scrapy.Field()
+    phone = scrapy.Field()
+    file_urls = scrapy.Field()
+    files = scrapy.Field()
+
+class StartupRegistrySpider(scrapy.Spider):
+    name = 'startup_registry'
+    allowed_domains = ['startup.registroimprese.it']
+    start_urls = ['https://startup.registroimprese.it/isin/home']
+    
+    custom_settings = {
+        'DOWNLOAD_DELAY': 2,  # Add delay between requests
+        'RANDOMIZE_DOWNLOAD_DELAY': True,
+        'USER_AGENT': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'HTTPERROR_ALLOW_ALL': True,  # Process pages that return errors
+        'DOWNLOAD_HANDLERS': {
+            'http': 'scrapy.core.downloader.handlers.http.HTTPDownloadHandler',
+            'https': 'scrapy.core.downloader.handlers.http.HTTPDownloadHandler',
+        },
+        'ITEM_PIPELINES': {
+            'scrapy.pipelines.files.FilesPipeline': 1,
+            'startup_crawler.StartupCsvPipeline': 300,
+        },
+        'FILES_STORE': 'downloads',
+        'CONCURRENT_REQUESTS': 1,  # Limit concurrent requests
+        'COOKIES_ENABLED': True,
+        'RETRY_TIMES': 5,
+        'RETRY_HTTP_CODES': [500, 502, 503, 504, 400, 403, 404, 408],
+        'DOWNLOADER_MIDDLEWARES': {
+            'startup_crawler.CustomHeadersMiddleware': 550,
+        },
+    }
+    
+    def __init__(self, *args, **kwargs):
+        super(StartupRegistrySpider, self).__init__(*args, **kwargs)
+        # Create downloads directory
+        os.makedirs('downloads', exist_ok=True)
+        # Track processed URLs
+        self.processed_urls = set()
+        # Company counter
+        self.company_count = 0
+        # Create document directory
+        os.makedirs('documents', exist_ok=True)
+        
+        # Initialize CSV file
+        self.csv_file = 'italian_startups.csv'
+        with open(self.csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'company_name', 'creation_date', 'region', 
+                'city', 'description', 'email', 'phone'
+            ])
+            writer.writeheader()
+    
+    def parse(self, response):
+        """Initial parse method for the homepage"""
+        logging.info(f"Parsing homepage: {response.url}")
+        
+        # Save response for analysis
+        self.save_response(response, 'homepage')
+        
+        # Try multiple search strategies
+        search_urls = [
+            'https://startup.registroimprese.it/isin/search?searchType=advanced',
+            'https://startup.registroimprese.it/isin/search',
+            'https://startup.registroimprese.it/isin/ricerca',
+            'https://startup.registroimprese.it/isin/search?stato=A',
+            'https://startup.registroimprese.it/isin/search?regione=',
         ]
         
-    def get_soup(self, url, method='get', data=None, params=None):
-        """Get BeautifulSoup object from a URL with detailed error handling"""
-        try:
-            logging.info(f"Requesting {url} with method {method}")
-            if method.lower() == 'post':
-                response = self.session.post(url, headers=self.headers, data=data)
+        # First try to extract search form and submit it
+        yield from self.try_submit_form(response)
+        
+        # Then try direct navigation to search URLs
+        for url in search_urls:
+            yield scrapy.Request(
+                url,
+                callback=self.parse_search_results,
+                errback=self.handle_error,
+                meta={'dont_redirect': False, 'handle_httpstatus_list': [302, 301]}
+            )
+    
+    def try_submit_form(self, response):
+        """Attempt to find and submit search forms"""
+        # Try to find search forms
+        forms = response.css('form')
+        logging.info(f"Found {len(forms)} forms on the page")
+        
+        for i, form in enumerate(forms):
+            action = form.css('::attr(action)').get()
+            method = form.css('::attr(method)').get() or 'GET'
+            
+            logging.info(f"Form {i+1}: action={action}, method={method}")
+            
+            # Extract form data
+            formdata = {}
+            for input_elem in form.css('input, select'):
+                name = input_elem.css('::attr(name)').get()
+                value = input_elem.css('::attr(value)').get() or ''
+                if name:
+                    formdata[name] = value
+            
+            # Add search parameters
+            formdata.update({
+                'searchType': 'advanced',
+                'searchValue': '',
+                'stato': 'A',
+            })
+            
+            # Build form action URL
+            action_url = urljoin(response.url, action) if action else 'https://startup.registroimprese.it/isin/search'
+            
+            logging.info(f"Submitting form to {action_url} with data: {formdata}")
+            
+            # Submit the form
+            if method.upper() == 'POST':
+                yield FormRequest(
+                    url=action_url,
+                    formdata=formdata,
+                    callback=self.parse_search_results,
+                    errback=self.handle_error,
+                    meta={'dont_redirect': False}
+                )
             else:
-                response = self.session.get(url, headers=self.headers, params=params)
-            
-            logging.info(f"Response status code: {response.status_code}")
-            
-            # Debug response headers and cookies
-            logging.info(f"Response cookies: {response.cookies.get_dict()}")
-            logging.info(f"Response headers: {dict(response.headers)}")
-            
-            response.raise_for_status()
-            
-            # Save the HTML for debugging if needed
-            with open("last_response.html", "w", encoding="utf-8") as f:
-                f.write(response.text)
-                
-            return BeautifulSoup(response.text, 'html.parser')
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error fetching {url}: {str(e)}")
-            if hasattr(e, 'response') and e.response:
-                logging.error(f"Response content: {e.response.text[:500]}...")
-            return None
+                yield scrapy.Request(
+                    url=action_url,
+                    callback=self.parse_search_results,
+                    errback=self.handle_error,
+                    meta={'formdata': formdata, 'dont_redirect': False}
+                )
+        
+        # Also look for search buttons and links
+        search_elements = response.css('a:contains("Cerca"), button:contains("Cerca"), a:contains("Search"), button:contains("Search")')
+        for elem in search_elements:
+            href = elem.css('::attr(href)').get()
+            if href and not href.startswith('#'):
+                url = urljoin(response.url, href)
+                yield scrapy.Request(
+                    url,
+                    callback=self.parse_search_results,
+                    errback=self.handle_error
+                )
     
-    def initialize_csv(self):
-        """Create CSV file with headers if it doesn't exist"""
-        if not os.path.exists(self.output_file):
-            with open(self.output_file, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-                writer.writeheader()
-    
-    def save_to_csv(self, company_data):
-        """Save company data to CSV file"""
-        with open(self.output_file, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-            writer.writerow(company_data)
-    
-    def get_csrf_token(self, soup):
-        """Extract CSRF token from the page"""
-        meta = soup.find('meta', attrs={'name': '_csrf'})
-        if meta and meta.get('content'):
-            return meta.get('content')
+    def parse_search_results(self, response):
+        """Parse the search results page"""
+        logging.info(f"Parsing search results: {response.url}")
         
-        # Alternative method
-        inputs = soup.find_all('input', attrs={'name': '_csrf'})
-        for input_field in inputs:
-            if input_field.get('value'):
-                return input_field.get('value')
-                
-        return None
+        # Save response for analysis
+        self.save_response(response, 'search_results')
         
-    def extract_form_data(self, soup):
-        """Extract all form inputs for accurate form submission"""
-        form = soup.find('form', attrs={'action': lambda x: x and 'search' in x.lower()})
-        if not form:
-            form = soup.find('form')  # Try to find any form
-            
-        if not form:
-            logging.error("No search form found on the page")
-            return {}
-            
-        form_data = {}
-        for input_field in form.find_all('input'):
-            name = input_field.get('name')
-            value = input_field.get('value', '')
-            if name:  # Only add if name attribute exists
-                form_data[name] = value
-                
-        # Add additional form parameters that might be required
-        form_data['searchValue'] = ''
-        form_data['searchType'] = 'advanced'
-        
-        return form_data
-    
-    def submit_search(self):
-        """Submit the search form to get results with detailed error handling"""
-        logging.info("Accessing home page...")
-        home_soup = self.get_soup(self.base_url)
-        if not home_soup:
-            logging.error("Failed to access home page")
-            return None
-        
-        # Extract CSRF token if present
-        csrf_token = self.get_csrf_token(home_soup)
-        if csrf_token:
-            logging.info(f"Found CSRF token: {csrf_token}")
-            self.headers['X-CSRF-TOKEN'] = csrf_token
-        
-        # Extract form data
-        form_data = self.extract_form_data(home_soup)
-        logging.info(f"Extracted form data: {form_data}")
-        
-        # Try a more comprehensive approach
-        params = {
-            'searchType': 'advanced',
-            'searchValue': '',
-            'ateco': '',
-            'comune': '',
-            'provincia': '',
-            'regione': '',
-            'stato': 'A'  # A might mean 'Active'
-        }
-        
-        # First try with GET parameters
-        results_soup = self.get_soup(self.search_url, params=params)
-        
-        # If that doesn't work, try POST with form data
-        if not results_soup or "No results" in results_soup.text:
-            logging.info("GET search failed or returned no results, trying POST...")
-            results_soup = self.get_soup(self.search_url, method='post', data=form_data)
-        
-        # Debug the results
-        if results_soup:
-            with open("search_results.html", "w", encoding="utf-8") as f:
-                f.write(str(results_soup))
-                
-        return results_soup
-    
-    def get_company_urls(self, results_soup):
-        """Extract company URLs from search results page with multiple selector attempts"""
-        if not results_soup:
-            return []
-        
+        # Extract company links using various selectors
         company_links = []
-        
-        # Try various selectors that might contain company links
         selectors = [
-            # Common patterns for company links
-            'a[href*="/company/"]',
-            'a[href*="/startup/"]',
-            'a[href*="/detail/"]',
-            'a[href*="/scheda/"]',
-            'a[href*="/impresa/"]',
-            # Class or ID based selectors
-            '.company-item a',
-            '.search-results a',
-            '.result-item a',
-            '#search-results a',
-            # Look for table rows
-            'table tr td a'
+            'a[href*="/company/"]', 'a[href*="/startup/"]', 
+            'a[href*="/detail/"]', 'a[href*="/scheda/"]',
+            'a[href*="/impresa/"]', 'a[href*="?id="]',
+            'table tr td a', '.company-item a', '.result-item a',
+            '.search-results a', '#search-results a'
         ]
         
         for selector in selectors:
-            logging.info(f"Trying selector: {selector}")
-            try:
-                elements = results_soup.select(selector)
-                if elements:
-                    logging.info(f"Found {len(elements)} elements with selector {selector}")
-                    for element in elements:
-                        href = element.get('href', '')
-                        if href and not href.startswith('#') and not href.startswith('javascript:'):
-                            if not href.startswith('http'):
-                                href = urljoin(self.base_url, href)
-                            company_links.append(href)
-            except Exception as e:
-                logging.error(f"Error with selector {selector}: {str(e)}")
+            links = response.css(selector)
+            for link in links:
+                href = link.css('::attr(href)').get()
+                if href:
+                    absolute_url = urljoin(response.url, href)
+                    if absolute_url not in company_links:
+                        company_links.append(absolute_url)
         
-        # If the above selectors didn't work, try a more general approach
+        # If specific selectors didn't work, try a more general approach
         if not company_links:
-            logging.info("No links found with specific selectors, trying generic approach")
-            for a_tag in results_soup.find_all('a', href=True):
-                href = a_tag['href']
-                # Look for patterns that might indicate a company detail page
-                if re.search(r'/(company|startup|detail|scheda|impresa)/', href, re.I) or \
-                   re.search(r'\bid=\d+', href, re.I):
-                    if not href.startswith('http'):
-                        href = urljoin(self.base_url, href)
-                    company_links.append(href)
+            # Try to find any links with patterns that suggest company pages
+            all_links = response.css('a[href]')
+            for link in all_links:
+                href = link.css('::attr(href)').get()
+                if href and re.search(r'/(company|startup|detail|scheda|impresa)/', href, re.I):
+                    absolute_url = urljoin(response.url, href)
+                    if absolute_url not in company_links:
+                        company_links.append(absolute_url)
         
-        # Remove duplicates
-        company_links = list(set(company_links))
-        logging.info(f"Found {len(company_links)} unique company links")
+        logging.info(f"Found {len(company_links)} potential company links")
         
-        return company_links
+        # Process each company URL
+        for url in company_links:
+            if url not in self.processed_urls:
+                self.processed_urls.add(url)
+                yield scrapy.Request(
+                    url,
+                    callback=self.parse_company,
+                    errback=self.handle_error,
+                    meta={'company_url': url}
+                )
+        
+        # Check for next page
+        next_page = self.get_next_page(response)
+        if next_page:
+            logging.info(f"Following next page: {next_page}")
+            yield scrapy.Request(
+                next_page,
+                callback=self.parse_search_results,
+                errback=self.handle_error
+            )
     
-    def get_next_page_url(self, soup):
-        """Get URL of the next page of results using multiple approaches"""
-        if not soup:
-            return None
-        
-        # Try multiple approaches to find the next page link
-        
-        # 1. Look for elements containing 'Next' or 'Successivo'
-        next_elements = [
-            soup.find('a', string=lambda s: s and ('Next' in s or 'Successivo' in s or 'Avanti' in s or '»' in s)),
-            soup.find('a', attrs={'aria-label': lambda s: s and ('Next' in s or 'Successivo' in s or 'Avanti' in s)}),
-            soup.find('a', attrs={'class': lambda c: c and ('next' in c or 'successivo' in c or 'avanti' in c)}),
-            soup.find('a', attrs={'rel': 'next'}),
-            soup.find('li', attrs={'class': 'next'})
+    def get_next_page(self, response):
+        """Extract the next page URL"""
+        # Try various next page selectors
+        selectors = [
+            'a:contains("Next")', 'a:contains("Successivo")',
+            'a:contains("Avanti")', 'a:contains("»")',
+            'a.next', 'a[rel="next"]',
+            'li.next a', 'a[aria-label="Next"]',
+            'a[aria-label="Successivo"]'
         ]
         
-        for elem in next_elements:
-            if elem:
-                if elem.name != 'a' and elem.find('a'):
-                    elem = elem.find('a')
-                
-                if elem.name == 'a' and elem.get('href'):
-                    href = elem['href']
-                    if not href.startswith('http'):
-                        href = urljoin(self.base_url, href)
-                    logging.info(f"Found next page link: {href}")
-                    return href
+        for selector in selectors:
+            next_links = response.css(selector)
+            for link in next_links:
+                href = link.css('::attr(href)').get()
+                if href:
+                    return urljoin(response.url, href)
         
-        # 2. Look for pagination elements
-        pagination = soup.find('ul', attrs={'class': lambda c: c and ('pagination' in c)})
-        if pagination:
-            # Find the active page
-            active = pagination.find('li', attrs={'class': lambda c: c and ('active' in c)})
-            if active:
-                # Try to find the next sibling with a link
-                next_li = active.find_next_sibling('li')
-                if next_li and next_li.find('a', href=True):
-                    href = next_li.find('a')['href']
-                    if not href.startswith('http'):
-                        href = urljoin(self.base_url, href)
-                    logging.info(f"Found next page link from pagination: {href}")
-                    return href
+        # Try to find pagination links and determine the current page
+        try:
+            # Find active page element
+            current_page = None
+            active_selectors = ['li.active', 'li.selected', 'a.active', 'a.selected']
+            for selector in active_selectors:
+                active = response.css(selector)
+                if active:
+                    # Extract page number
+                    current_text = active.css('::text').get()
+                    if current_text and current_text.strip().isdigit():
+                        current_page = int(current_text.strip())
+                        break
+            
+            if current_page:
+                # Look for next page number
+                next_page_num = current_page + 1
+                next_link = response.css(f'a:contains("{next_page_num}")')
+                if next_link:
+                    href = next_link.css('::attr(href)').get()
+                    if href:
+                        return urljoin(response.url, href)
+        except Exception as e:
+            logging.warning(f"Error finding pagination: {str(e)}")
         
-        logging.info("No next page link found")
         return None
     
-    def extract_company_info(self, company_url):
-        """Extract required company information with detailed debugging"""
-        logging.info(f"Extracting data from: {company_url}")
-        soup = self.get_soup(company_url)
-        if not soup:
-            logging.error(f"Failed to load company page: {company_url}")
-            return None
+    def parse_company(self, response):
+        """Extract company information"""
+        company_url = response.meta.get('company_url', response.url)
+        logging.info(f"Parsing company page: {company_url}")
         
-        company_info = {
-            'company_name': '',
-            'creation_date': '',
-            'region': '',
-            'city': '',
-            'description': '',
-            'email': '',
-            'phone': ''
-        }
+        # Save response for analysis
+        self.save_response(response, f'company_{self.company_count + 1}')
         
-        # Debug the page structure
-        page_text = soup.get_text()
-        logging.info(f"Page content length: {len(page_text)}")
-        logging.info(f"Page content sample: {page_text[:200]}...")
+        # Create new item
+        item = StartupItem()
         
-        # Save company page for debugging
-        with open(f"company_page_{int(time.time())}.html", "w", encoding="utf-8") as f:
-            f.write(str(soup))
-        
-        # Extract data using multiple approaches
-        
-        # 1. Company name
+        # 1. Extract company name
         name_selectors = [
-            'h1', 'h2', '.company-name', '#company-name',
-            'div.header h1', 'div.intestazione h1',
-            'div.company-header h1', '.ragione-sociale'
+            'h1::text', 'h2::text', 
+            '.company-name::text', '#company-name::text',
+            'div.header h1::text', 'div.intestazione h1::text',
+            '.ragione-sociale::text'
         ]
         
-        for selector in name_selectors:
-            element = soup.select_one(selector)
-            if element and element.text.strip():
-                company_info['company_name'] = element.text.strip()
-                logging.info(f"Found company name: {company_info['company_name']}")
-                break
+        item['company_name'] = self.extract_with_selectors(response, name_selectors) or "Unknown Company"
         
-        # 2. Creation date - look for elements containing date-related labels
+        # 2. Extract creation date
         date_labels = [
             'Data Costituzione', 'Data di costituzione', 'Costituzione', 
-            'Foundation Date', 'Data iscrizione', 'Data', 'Anno fondazione',
-            'Costituita il', 'Established on', 'Established in'
+            'Foundation Date', 'Data iscrizione', 'Costituita il'
         ]
         
-        for label in date_labels:
-            # Method 1: Look for text containing the label
-            elements = soup.find_all(lambda tag: tag.name and tag.string and 
-                                    label.lower() in tag.get_text().lower())
-            
-            for element in elements:
-                # Try to find the value in the next sibling or child
-                value = self._get_adjacent_text(element)
-                if value and re.search(r'\d{2}[/.-]\d{2}[/.-]\d{4}|\d{4}', value):  # Date pattern
-                    company_info['creation_date'] = value.strip()
-                    logging.info(f"Found creation date: {company_info['creation_date']}")
-                    break
-            
-            if company_info['creation_date']:
-                break
+        item['creation_date'] = self.extract_labeled_field(response, date_labels)
         
-        # 3. Region
+        # If not found, try regex
+        if not item['creation_date']:
+            date_patterns = [
+                r'(?:costituzione|costituita|foundation|created).*?(\d{2}[/.-]\d{2}[/.-]\d{4})',
+                r'(?:costituzione|costituita|foundation|created).*?(\d{4}[/.-]\d{2}[/.-]\d{2})'
+            ]
+            
+            for pattern in date_patterns:
+                matches = re.findall(pattern, response.text, re.I)
+                if matches:
+                    item['creation_date'] = matches[0]
+                    break
+        
+        # 3. Extract region
         region_labels = ['Regione', 'Region', 'Territory']
-        for label in region_labels:
-            elements = soup.find_all(lambda tag: tag.name and tag.string and 
-                                    label.lower() in tag.get_text().lower())
-            
-            for element in elements:
-                value = self._get_adjacent_text(element)
-                if value:
-                    company_info['region'] = value.strip()
-                    logging.info(f"Found region: {company_info['region']}")
-                    break
-            
-            if company_info['region']:
-                break
+        item['region'] = self.extract_labeled_field(response, region_labels)
         
-        # 4. City
+        # 4. Extract city
         city_labels = ['Comune', 'Città', 'City', 'Località', 'Location', 'Sede']
-        for label in city_labels:
-            elements = soup.find_all(lambda tag: tag.name and tag.string and 
-                                    label.lower() in tag.get_text().lower())
-            
-            for element in elements:
-                value = self._get_adjacent_text(element)
-                if value:
-                    company_info['city'] = value.strip()
-                    logging.info(f"Found city: {company_info['city']}")
-                    break
-            
-            if company_info['city']:
-                break
+        item['city'] = self.extract_labeled_field(response, city_labels)
         
-        # 5. Description
+        # 5. Extract description
         desc_selectors = [
-            '.description', '#description', '.company-description', 
-            '#company-description', '.about', '#about', '.profile', 
-            '#profile', '.activity', '#activity'
+            '.description::text', '#description::text',
+            '.company-description::text', '#company-description::text',
+            '.about::text', '#about::text', '.profile::text', '#profile::text'
         ]
         
-        for selector in desc_selectors:
-            element = soup.select_one(selector)
-            if element and element.text.strip():
-                company_info['description'] = element.text.strip()
-                logging.info(f"Found description (length: {len(company_info['description'])})")
-                break
+        item['description'] = self.extract_with_selectors(response, desc_selectors)
         
-        # 6. Email - look for mailto links and email patterns
-        # Method 1: mailto links
-        email_links = soup.find_all('a', href=lambda href: href and 'mailto:' in href)
+        # If no description found, look for paragraphs in main content
+        if not item['description']:
+            main_selectors = ['main', 'article', '.content', '#content', '.main-content', '#main-content']
+            for selector in main_selectors:
+                paragraphs = response.css(f'{selector} p::text').getall()
+                if paragraphs:
+                    desc_text = " ".join([p.strip() for p in paragraphs[:3] if p.strip()])
+                    if desc_text:
+                        item['description'] = desc_text
+                        break
+        
+        # 6. Extract email
+        # First try mailto links
+        email_links = response.css('a[href^="mailto:"]::attr(href)').getall()
         for link in email_links:
-            email = link.get('href', '').replace('mailto:', '').strip()
-            if '@' in email:
-                company_info['email'] = email
-                logging.info(f"Found email: {company_info['email']}")
+            email = link.replace('mailto:', '').strip()
+            if '@' in email and '.' in email:  # Basic validation
+                item['email'] = email
                 break
         
-        # Method 2: Look for email pattern in text
-        if not company_info['email']:
+        # If not found, try regex
+        if not item.get('email'):
             email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-            email_matches = re.findall(email_pattern, page_text)
+            email_matches = re.findall(email_pattern, response.text)
             if email_matches:
-                company_info['email'] = email_matches[0]
-                logging.info(f"Found email with regex: {company_info['email']}")
+                # Filter out common non-company emails
+                filtered_emails = [e for e in email_matches if not any(domain in e.lower() for domain in ['example.com', 'gmail.com', 'libero.it', 'hotmail'])]
+                if filtered_emails:
+                    item['email'] = filtered_emails[0]
+                else:
+                    item['email'] = email_matches[0]
         
-        # 7. Phone number
+        # 7. Extract phone number
         phone_labels = ['Telefono', 'Tel', 'Phone', 'Contatto', 'Contact']
-        for label in phone_labels:
-            elements = soup.find_all(lambda tag: tag.name and tag.string and 
-                                    label.lower() in tag.get_text().lower())
+        item['phone'] = self.extract_labeled_field(response, phone_labels)
+        
+        # If not found, try regex
+        if not item.get('phone'):
+            phone_patterns = [
+                r'\+39\s?\d{10}',
+                r'\+39\s?\d{3}[-\s]?\d{7}',
+                r'\+39\s?\d{2}[-\s]?\d{8}',
+                r'\+39\s?\d{3}[-\s]?\d{3}[-\s]?\d{4}',
+                r'\+39\s?\d{3}[-\s]?\d{4}[-\s]?\d{3}',
+                r'0\d{1,3}[-\s]?\d{6,7}',
+                r'3\d{2}[-\s]?\d{6,7}'  # Mobile
+            ]
             
-            for element in elements:
-                value = self._get_adjacent_text(element)
-                # Look for phone number patterns
-                if value and re.search(r'[\d\s+().-]{7,}', value):
-                    company_info['phone'] = value.strip()
-                    logging.info(f"Found phone: {company_info['phone']}")
+            for pattern in phone_patterns:
+                matches = re.findall(pattern, response.text)
+                if matches:
+                    item['phone'] = matches[0].strip()
                     break
+        
+        # 8. Look for downloadable files
+        file_urls = []
+        
+        # Look for PDF, DOC, DOCX, XLS, XLSX links
+        file_selectors = [
+            'a[href$=".pdf"]::attr(href)',
+            'a[href$=".doc"]::attr(href)',
+            'a[href$=".docx"]::attr(href)',
+            'a[href$=".xls"]::attr(href)',
+            'a[href$=".xlsx"]::attr(href)',
+            'a[href*="download"]::attr(href)',
+            'a[href*="allegato"]::attr(href)',
+            'a[href*="attachment"]::attr(href)'
+        ]
+        
+        for selector in file_selectors:
+            urls = response.css(selector).getall()
+            for url in urls:
+                if url:
+                    absolute_url = urljoin(response.url, url)
+                    if absolute_url not in file_urls:
+                        file_urls.append(absolute_url)
+        
+        if file_urls:
+            item['file_urls'] = file_urls
             
-            if company_info['phone']:
-                break
-        
-        # Method 2: Look for phone number pattern in text
-        if not company_info['phone']:
-            phone_pattern = r'(?:\+\d{1,3})?(?:\s|\()?\d{2,4}(?:\s|\))?\s?\d{3,4}(?:\s|-|–)?\d{3,4}'
-            phone_matches = re.findall(phone_pattern, page_text)
-            if phone_matches:
-                company_info['phone'] = phone_matches[0]
-                logging.info(f"Found phone with regex: {company_info['phone']}")
-        
-        return company_info
-    
-    def _get_adjacent_text(self, element):
-        """Helper to get text from adjacent elements with multiple strategies"""
-        # Strategy 1: Get text from the next sibling
-        next_sibling = element.next_sibling
-        if next_sibling and isinstance(next_sibling, str) and next_sibling.strip():
-            return next_sibling.strip()
-        
-        # Strategy 2: Get text from the next element
-        next_elem = element.find_next()
-        if next_elem and next_elem.string and next_elem.string.strip():
-            return next_elem.string.strip()
-        
-        # Strategy 3: Look for specific value containers
-        parent = element.parent
-        if parent:
-            value_containers = parent.find_all(['span', 'div', 'td'], class_=lambda c: c and 'value' in c)
-            for container in value_containers:
-                if container.text.strip():
-                    return container.text.strip()
-        
-        # Strategy 4: For table structures, look for the next cell
-        if element.name == 'td' or element.parent.name == 'td':
-            td = element if element.name == 'td' else element.parent
-            next_td = td.find_next('td')
-            if next_td and next_td.text.strip():
-                return next_td.text.strip()
-        
-        return ''
-    
-    def crawl(self):
-        """Main crawling function with robust error handling"""
-        logging.info("Starting crawler")
-        self.initialize_csv()
-        
-        # Step 1: Submit search to get results
-        results_soup = self.submit_search()
-        if not results_soup:
-            logging.error("Failed to get search results")
-            return
-        
-        # Check if results page indicates no results
-        if "No results" in results_soup.get_text() or "Nessun risultato" in results_soup.get_text():
-            logging.warning("Search returned no results")
-            logging.info("Trying alternative search approach...")
-            
-            # Try alternative search approach with minimal parameters
-            results_soup = self.get_soup(self.search_url, params={'stato': 'A'})
-            
-            if not results_soup or "No results" in results_soup.get_text():
-                logging.error("All search attempts failed to return results")
-                return
-        
-        page_num = 1
-        companies_processed = 0
-        total_companies_found = 0
-        max_pages = 50  # Limit to prevent infinite loops
-        
-        # Step 2: Process each page of results
-        while results_soup and page_num <= max_pages:
-            logging.info(f"Processing page {page_num}")
-            
-            # Step 3: Get company URLs from current page
-            company_urls = self.get_company_urls(results_soup)
-            logging.info(f"Found {len(company_urls)} companies on page {page_num}")
-            total_companies_found += len(company_urls)
-            
-            # Step 4: Process each company
-            for i, company_url in enumerate(company_urls):
+            # Also download files directly with wget as a backup
+            for file_url in file_urls:
                 try:
-                    logging.info(f"Processing company {i+1}/{len(company_urls)} on page {page_num}")
+                    filename = os.path.basename(file_url)
+                    if not filename or filename.isspace():
+                        filename = f"file_{self.company_count + 1}_{random.randint(1000, 9999)}.pdf"
+                        
+                    save_path = os.path.join('documents', filename)
+                    logging.info(f"Downloading file: {file_url} to {save_path}")
                     
-                    company_info = self.extract_company_info(company_url)
-                    if company_info:
-                        self.save_to_csv(company_info)
-                        companies_processed += 1
-                        logging.info(f"Saved data for: {company_info['company_name']}")
-                    else:
-                        logging.warning(f"Failed to extract info from: {company_url}")
+                    # Download the file with wget (more reliable for some sites)
+                    wget.download(file_url, out=save_path)
                     
-                    # Add delay to avoid overloading the server
-                    time.sleep(random.uniform(1, 3))
                 except Exception as e:
-                    logging.error(f"Error processing company {company_url}: {str(e)}")
-                    continue
-            
-            # Step 5: Move to next page if available
-            next_url = self.get_next_page_url(results_soup)
-            if next_url:
-                logging.info(f"Moving to page {page_num + 1}")
-                page_num += 1
-                time.sleep(random.uniform(2, 5))  # Delay between pages
-                results_soup = self.get_soup(next_url)
+                    logging.error(f"Error downloading file {file_url}: {str(e)}")
+        
+        # Increment company counter
+        self.company_count += 1
+        
+        # Save to CSV directly as a backup
+        self.save_to_csv(dict(item))
+        
+        # Return the item for pipeline processing
+        logging.info(f"Extracted data for company #{self.company_count}: {item['company_name']}")
+        return item
+    
+    def extract_with_selectors(self, response, selectors):
+        """Extract content using multiple selectors"""
+        for selector in selectors:
+            try:
+                content = response.css(selector).get()
+                if content and content.strip():
+                    return content.strip()
+            except Exception:
+                continue
                 
-                # Save the page for debugging
-                if results_soup:
-                    with open(f"results_page_{page_num}.html", "w", encoding="utf-8") as f:
-                        f.write(str(results_soup))
-            else:
-                logging.info("No more pages found")
-                break
+        return None
+    
+    def extract_labeled_field(self, response, labels):
+        """Extract content associated with a label"""
+        # Try various approaches to find labeled content
         
-        if total_companies_found == 0:
-            logging.warning("No companies were found. The website structure might have changed.")
-            logging.info("Please check the HTML files saved for debugging.")
+        # Method 1: Look for elements containing the label
+        for label in labels:
+            # Try elements containing the exact label
+            elements = response.xpath(f'//*[contains(text(), "{label}")]')
+            for element in elements:
+                # Check if the element itself contains the value
+                full_text = element.css('::text').get() or ''
+                if ':' in full_text:
+                    parts = full_text.split(':', 1)
+                    if len(parts) > 1 and parts[1].strip():
+                        return parts[1].strip()
+                
+                # Look for next sibling or next element
+                next_text = element.xpath('./following-sibling::*[1]//text()').get()
+                if next_text and next_text.strip():
+                    return next_text.strip()
+                
+                # Look for parent's next child
+                parent_next = element.xpath('../*[position()=count(../*[.=current()])+1]//text()').get()
+                if parent_next and parent_next.strip():
+                    return parent_next.strip()
         
-        logging.info(f"Crawling completed. Found {total_companies_found} companies, processed {companies_processed}.")
-        logging.info(f"Data saved to {self.output_file}")
+        # Method 2: Look for table structures
+        for label in labels:
+            # Find table cells containing the label
+            cells = response.xpath(f'//td[contains(text(), "{label}")]')
+            for cell in cells:
+                # Try to get the next cell in the same row
+                next_cell = cell.xpath('./following-sibling::td[1]//text()').get()
+                if next_cell and next_cell.strip():
+                    return next_cell.strip()
+        
+        # Method a third approach with CSS selectors
+        for label in labels:
+            # Look for definition lists
+            dt = response.css(f'dt:contains("{label}")')
+            if dt:
+                dd = dt.xpath('./following-sibling::dd[1]//text()').get()
+                if dd and dd.strip():
+                    return dd.strip()
+        
+        return None
+    
+    def save_response(self, response, name):
+        """Save response for debugging"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"debug_{name}_{timestamp}.html"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(response.text)
+        logging.info(f"Saved response to {filename}")
+    
+    def save_to_csv(self, item_dict):
+        """Save item to CSV file directly"""
+        # Extract only the relevant fields for CSV
+        csv_data = {field: item_dict.get(field, '') for field in [
+            'company_name', 'creation_date', 'region', 
+            'city', 'description', 'email', 'phone'
+        ]}
+        
+        # Write to CSV file
+        with open(self.csv_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=csv_data.keys())
+            writer.writerow(csv_data)
+        
+        logging.info(f"Saved data to CSV for: {csv_data['company_name']}")
+    
+    def handle_error(self, failure):
+        """Handle request errors"""
+        logging.error(f"Request failed: {failure.value}")
+        request = failure.request
+        if hasattr(failure.value, 'response') and failure.value.response:
+            response = failure.value.response
+            logging.error(f"Status code: {response.status}")
+            self.save_response(response, f"error_{response.status}")
 
-if __name__ == "__main__":
-    crawler = ItalianStartupCrawler()
-    crawler.crawl()
+class StartupCsvPipeline:
+    """Pipeline for saving startup data to CSV"""
+    
+    def __init__(self):
+        self.csv_file = 'italian_startups.csv'
+        self.ensure_csv_exists()
+    
+    def ensure_csv_exists(self):
+        if not os.path.exists(self.csv_file):
+            with open(self.csv_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    'company_name', 'creation_date', 'region', 
+                    'city', 'description', 'email', 'phone'
+                ])
+                writer.writeheader()
+    
+    def process_item(self, item, spider):
+        # Write to CSV file
+        with open(self.csv_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'company_name', 'creation_date', 'region', 
+                'city', 'description', 'email', 'phone'
+            ])
+            csv_item = {field: item.get(field, '') for field in writer.fieldnames}
+            writer.writerow(csv_item)
+        
+        return item
+
+class CustomHeadersMiddleware:
+    """Middleware to add custom headers to requests"""
+    
+    def process_request(self, request, spider):
+        # Add headers to appear more like a regular browser
+        request.headers.update({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Cache-Control': 'max-age=0',
+            'Sec-Ch-Ua': '"Chromium";v="122", "Google Chrome";v="122"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"macOS"',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
+            'Referer': 'https://startup.registroimprese.it/isin/home'
+        })
+        return None
+
+if __name__ == '__main__':
+    # Configure crawler settings
+    settings = get_project_settings()
+    settings.update({
+        'BOT_NAME': 'startup_registry_crawler',
+        'LOG_LEVEL': 'INFO',
+        'DOWNLOAD_DELAY': 2,
+        'RANDOMIZE_DOWNLOAD_DELAY': True,
+        'USER_AGENT': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'HTTPERROR_ALLOW_ALL': True,
+        'ITEM_PIPELINES': {
+            'scrapy.pipelines.files.FilesPipeline': 1,
+            '__main__.StartupCsvPipeline': 300,
+        },
+        'FILES_STORE': 'downloads',
+        'CONCURRENT_REQUESTS': 1,
+        'COOKIES_ENABLED': True,
+        'RETRY_TIMES': 5,
+        'RETRY_HTTP_CODES': [500, 502, 503, 504, 400, 403, 404, 408],
+        'DOWNLOADER_MIDDLEWARES': {
+            '__main__.CustomHeadersMiddleware': 550,
+        },
+    })
+    
+    # Run the crawler
+    process = CrawlerProcess(settings)
+    process.crawl(StartupRegistrySpider)
+    process.start()
